@@ -16,7 +16,9 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -510,9 +512,10 @@ func TestResyncManagerDCPResumeStoppedProcessChangeCollections(t *testing.T) {
 
 // testDBForResyncOptions defines options for setting up a test database for resync tests.
 type testDBForResyncOptions struct {
-	docsToCreate                 int     // number of documents to create
-	updateSyncFuncAfterDocsAdded bool    // update the sync function after documents have been added
-	resyncPartitions             *uint16 // optional value to overwrite the number of partitions
+	docsToCreate                 int         // number of documents to create
+	updateSyncFuncAfterDocsAdded bool        // update the sync function after documents have been added
+	resyncPartitions             *uint16     // optional value to overwrite the number of partitions
+	bucket                       base.Bucket // optional bucket for the database, defaults to a new test bucket
 }
 
 // setupTestDBForResyncWithDocs creates a databases and seeds it with documents for setupTestDBForResyncWithDocs
@@ -527,7 +530,11 @@ func setupTestDBForResyncWithDocs(t testing.TB, opts testDBForResyncOptions) (*D
 		}
 	}
 
-	db, ctx := SetupTestDBWithOptions(t, dbcOptions)
+	bucket := opts.bucket
+	if bucket == nil {
+		bucket = base.GetTestBucket(t)
+	}
+	db, ctx := SetupTestDBForBucketWithOptions(t, bucket, dbcOptions)
 	syncFn := `
 function sync(doc, oldDoc){
 	channel("channel.ABC");
@@ -1078,7 +1085,7 @@ func TestResyncManagerDCPWritesV1SyncInfoAtCcv41(t *testing.T) {
 
 // TestResyncManagerOptionsStoredInMeta verifies that the options passed when starting a resync are embedded
 // in the "options" field of the meta returned by GetProcessStatus, so that BackgroundManager.Join can
-// read them back from the status document.
+// read them back from the status document. Reset is left out, because a joining node must not replay it.
 func TestResyncManagerOptionsStoredInMeta(t *testing.T) {
 	inputCollections := base.CollectionNames{"scope1": []string{"col1", "col2"}}
 
@@ -1097,8 +1104,13 @@ func TestResyncManagerOptionsStoredInMeta(t *testing.T) {
 	require.NoError(t, base.JSONUnmarshal(metaBytes, &metaDoc))
 
 	require.Equal(t, false, metaDoc.Options.RegenerateSequences)
-	require.Equal(t, true, metaDoc.Options.Reset)
 	require.Equal(t, inputCollections, metaDoc.Options.Collections)
+	require.NotContains(t, string(metaBytes), `"reset"`)
+
+	// 4.1 nodes write reset into the status document, a joining node must still ignore it
+	var options ResyncOptions
+	require.NoError(t, base.JSONUnmarshal([]byte(`{"reset": true}`), &options))
+	require.False(t, options.Reset)
 }
 
 // TestResyncDCPInitStoresOptionsInMeta verifies that Init stores the options it receives in the meta returned
@@ -1168,7 +1180,7 @@ func TestResyncManagerDCPJoinRoundTripsOptions(t *testing.T) {
 	defer func() { _ = mgr1.Stop(ctx) }()
 
 	// Empty Collections means "all collections" (no per-collection lookup in Init).
-	// RegenerateSequences and Reset are both non-zero so a silent field drop would be caught.
+	// RegenerateSequences is non-zero so a silent field drop would be caught. Reset must not round trip.
 	inputOptions := ResyncOptions{
 		Collections:         db.collectionNames(),
 		RegenerateSequences: true,
@@ -1194,7 +1206,9 @@ func TestResyncManagerDCPJoinRoundTripsOptions(t *testing.T) {
 	resync2 := mgr2.Process.(*ResyncManagerDCP)
 	resync2.lock.RLock()
 	defer resync2.lock.RUnlock()
-	require.Equal(t, inputOptions, resync2.startOptions)
+	expectedOptions := inputOptions
+	expectedOptions.Reset = false
+	require.Equal(t, expectedOptions, resync2.startOptions)
 }
 
 // TestNewResyncManagerDCPUpdateDatabaseState verifies that NewResyncManagerDCP wires updateDatabaseState
@@ -1327,28 +1341,24 @@ func TestResyncCheckpointsRemovedOnCompletion(t *testing.T) {
 // TestResyncResetPurgesStoppedRunCheckpoints asserts that a reset purges the checkpoints of the run it
 // abandons.
 func TestResyncResetPurgesStoppedRunCheckpoints(t *testing.T) {
-	t.Skip("TODO: CBG-5842 resync reset does not purge the previous run's checkpoints")
-	docsToCreate := 1000
-	if base.UnitTestUrlIsWalrus() || usingShardedResync(t) {
-		// rosmar runs too quickly, increase doc count
-		docsToCreate *= 5
-	}
 	db, ctx := setupTestDBForResyncWithDocs(t, testDBForResyncOptions{
-		docsToCreate:                 docsToCreate,
+		docsToCreate:                 10,
 		updateSyncFuncAfterDocsAdded: true,
 		resyncPartitions:             new(uint16(1)),
+		bucket:                       base.NewLeakyBucket(base.GetTestBucket(t), base.LeakyBucketConfig{}),
 	})
 	defer db.Close(ctx)
 
 	process := db.ResyncManager.Process.(*ResyncManagerDCP)
 
+	collection, _ := GetSingleDatabaseCollectionWithUser(ctx, t, db)
+	pauser := NewResyncPauser(t, collection.GetCollectionDatastore())
+	defer pauser.Close()
+	pauser.Pause()
 	require.NoError(t, db.ResyncManager.Start(ctx, ResyncOptions{Collections: base.NewCollectionNames()}))
-	wg := sync.WaitGroup{}
-	defer base.WaitWithTimeout(t, &wg, 30*time.Second)
-	wg.Go(func() {
-		waitForResyncDocsProcessed(t, db, 200)
-		require.NoError(t, db.ResyncManager.Stop(ctx))
-	})
+	pauser.WaitUntilBlocked()
+	require.NoError(t, db.ResyncManager.Stop(ctx))
+	pauser.Release()
 	stopped := waitForResyncState(t, db, BackgroundProcessStateStopped)
 	require.NotEmpty(t, stopped.ResyncID)
 
@@ -1411,4 +1421,60 @@ func TestResyncUnregisterFeedStoppedDest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestJoinResyncDatabaseState verifies that joining a resync started on another node moves an offline database to
+// resyncing while the resync runs.
+func TestJoinResyncDatabaseState(t *testing.T) {
+	bucket := base.GetTestBucket(t).LeakyBucketClone(base.LeakyBucketConfig{})
+	db, ctx := setupTestDBForBucket(t, bucket)
+	defer db.Close(ctx)
+	collection, ctx := GetSingleDatabaseCollectionWithUser(ctx, t, db)
+	_, _, err := collection.Put(ctx, "doc1", Body{"foo": "bar"})
+	require.NoError(t, err)
+
+	// rosmar uses a single node resync manager, so swap in the multi node manager that a distributed resync uses
+	db.ResyncManager = &BackgroundManager[ResyncOptions]{
+		name: "resync",
+		Process: &ResyncManagerDCP{
+			db:                db.DatabaseContext,
+			completedvBuckets: newvBucketTracker(),
+		},
+		clusterAwareOptions: &ClusterAwareBackgroundManagerOptions{
+			metadataStore: db.MetadataStore,
+			metaKeys:      db.MetadataKeys,
+			processSuffix: "resync",
+			multiNode:     true,
+		},
+		terminator: base.NewSafeTerminator(),
+	}
+	atomic.StoreUint32(&db.State, DBOffline)
+
+	// hold the joined resync at the document so the state can be checked while it runs
+	leakyDataStore, ok := base.AsLeakyDataStore(collection.dataStore)
+	require.True(t, ok)
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var blockedOnce, releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	leakyDataStore.SetWriteUpdateWithXattrsCallback(func(key string) {
+		if strings.HasPrefix(key, base.SyncDocPrefix) {
+			return
+		}
+		blockedOnce.Do(func() { close(blocked) })
+		<-release
+	})
+
+	// stands in for the status document written by the node that started the resync
+	require.NoError(t, db.MetadataStore.Set(ctx, db.ResyncManager.clusterAwareOptions.StatusDocID(), 0, nil, map[string]any{
+		"status": map[string]any{"status": BackgroundProcessStateRunning},
+		"meta":   map[string]any{"options": ResyncOptions{}},
+	}))
+	require.NoError(t, db.ResyncManager.Join(ctx))
+	base.RequireChanClosed(t, blocked)
+	require.Equal(t, RunStateString[DBResyncing], RunStateString[atomic.LoadUint32(&db.State)])
+
+	releaseOnce.Do(func() { close(release) })
+	RequireBackgroundManagerState(t, db.ResyncManager, BackgroundProcessStateCompleted)
+	require.Equal(t, RunStateString[DBOffline], RunStateString[atomic.LoadUint32(&db.State)])
 }

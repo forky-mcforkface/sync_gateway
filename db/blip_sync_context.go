@@ -810,7 +810,11 @@ func (bsc *BlipSyncContext) sendRevision(ctx context.Context, sender *blip.Sende
 	base.TracefCtx(ctx, base.KeySync, "sendRevision, rev attachments for %s/%s are %v", base.UD(docID), revID, base.UD(docRev.Attachments))
 	attachmentStorageMeta := ToAttachmentStorageMeta(docRev.Attachments)
 	var bodyBytes []byte
-	if base.IsEnterpriseEdition() {
+	if docRev.Deleted {
+		// A stored tombstone body can carry an internal _deleted property, which the peer would reject. Deletion
+		// travels as the deleted property instead, matching what delta sync sends for a tombstone.
+		bodyBytes = []byte(base.EmptyDocument)
+	} else if base.IsEnterpriseEdition() {
 		// Still need to stamp _attachments into BLIP messages
 		if len(docRev.Attachments) > 0 {
 			DeleteAttachmentVersion(docRev.Attachments)
@@ -1014,10 +1018,10 @@ func (bsc *BlipSyncContext) getKnownRevs(ctx context.Context, docID string, know
 		}
 	}
 
-	if cvInKnownRevs && len(knownRevsArray) > 2 {
-		// invalid format received
-		base.DebugfCtx(ctx, base.KeySync, "Invalid known rev format for doc: %s, too many entries in array %v", base.UD(docID), knownRevsArray)
-		return deltaSrcRev, changeIsLegacyRev, knownRevs, errors.New("invalid known rev format")
+	// If we are replicating in isgr mode we only expect maximum 2 entries for the known revs array.
+	if bsc.clientType == BLIPClientTypeSGR2 && cvInKnownRevs && len(knownRevsArray) > 2 {
+		// Assert in dev mode; in production, log the invalid format and continue processing the change.
+		base.AssertfCtx(ctx, "Invalid known rev format for doc with ISGR v4: %s, too many entries in array %v, expected maximally 2 when the first is a CV", base.UD(docID), knownRevsArray)
 	}
 
 	return deltaSrcRev, changeIsLegacyRev, knownRevs, nil
